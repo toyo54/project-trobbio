@@ -1,0 +1,19 @@
+# .cargo/config.toml
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --chip esp32c6 --monitor"
+rustflags = [
+  # "-C",
+  # "link-arg=-Tlink.x",
+  "-C",
+  "link-arg=-n",
+  "-C",
+  "link-arg=-zmax-page-size=4",
+  "-C",
+  "link-arg=-znoseparate-code",
+]
+
+[unstable]
+build-std = ["core"]

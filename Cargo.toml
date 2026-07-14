@@ -1,0 +1,24 @@
+[package]
+name = "project-trobbio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# single-hart: removes _mp_hook requirement (ESP32-C6 has one hart we use)
+riscv = { version = "0.16", features = ["critical-section-single-hart"] }
+esp32c6 = "0.23.2"
+
+[[bin]]
+name = "project-trobbio"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1 # Optimize the whole program at once
+# lto = true        # Drops dead code (HUGE size reduction)
+# opt-level = "s"   # Optimize for size
+# strip = true      # Remove leftover debug symbols

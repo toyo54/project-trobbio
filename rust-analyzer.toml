@@ -1,0 +1,14 @@
+[cargo]
+target = "riscv32imac-unknown-none-elf"
+buildScripts.enable = false
+
+[procMacro]
+enable = false
+
+[server]
+extraEnv = { CARGO_TARGET_DIR = "target/rust-analyzer" }
+
+[checkOnSave]
+allTargets = false
+command = "check"
+extraArgs = ["--target", "riscv32imac-unknown-none-elf"]
