@@ -14,7 +14,7 @@ mod arch;
 mod drivers;
 mod hal;
 
-global_asm!(".global _vector_table", include_str!("boot.s"));
+global_asm!(include_str!("boot.s"));
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

@@ -1,14 +1,10 @@
-//! Polling UART0 driver. UART0 is the same UART already wired to your
+//! Polling UART0 driver. UART0 is the same UART already wired to the
 //! board's USB-serial bridge (the one flashing tools use), so this gives
 //! you a console over the same cable — no jumpers, no loopback config.
 //!
 //! No INTPRI/interrupt setup involved: TX/RX here are plain busy-wait
 //! polling on FIFO counts, same category of access as gpio.rs/watchdog.rs.
 //! Interrupt-driven RX (the actual reason to touch INTPRI) is a later step.
-//!
-//! Verified against the real esp32c6 v0.23.2 PAC source, same as CLINT:
-//! `clk_conf().sclk_sel()`'s doc comment confirms `1 == 80MHz (APB) clock`,
-//! which is the one field value here I couldn't otherwise be fully sure of.
 
 use super::timer;
 use esp32c6::UART0;

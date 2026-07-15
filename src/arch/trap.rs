@@ -127,7 +127,7 @@ pub fn register(id: InterruptId, handler: Handler) {
     });
 }
 
-/// Registers a handler for anything that traps as a genuine exception
+/// Registers a handler for anything that traps as an exception
 /// (`mcause` with the interrupt bit clear). Defaults to clearing MPIE if
 /// nothing is registered.
 pub fn set_exception_handler(handler: ExceptionHandler) {
@@ -187,7 +187,7 @@ pub fn init_periodic_timer(period_ticks: u64) {
     }
     set_next_tick_at(now() + period_ticks);
 
-    // MTIMECTL is a genuinely 32-bit register with real bitfields (MTCE,
+    // MTIMECTL is a 32-bit register with real bitfields (MTCE,
     // MTIE, ...), no torn-access risk — use the PAC normally here.
     let clint = unsafe { CLINT::steal() };
     clint
@@ -252,7 +252,7 @@ fn call_registered(id: usize) {
     }
 }
 
-/// Routes a genuine exception (mcause interrupt bit clear) to whatever's
+/// Routes an exception (mcause interrupt bit clear) to whatever's
 /// registered, falling back to clearing MPIE if nothing is.
 fn dispatch_exception(cause: usize) {
     match unsafe { EXCEPTION_HANDLER } {
