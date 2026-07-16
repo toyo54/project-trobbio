@@ -67,6 +67,15 @@ pub extern "C" fn main() -> ! {
 
     writeln!(uart::Uart0, "boot complete, entering idle loop").ok();
 
+    // Tests uart1
+    hal::uart1::init(4, 5, 115200);
+    hal::uart1::set_loopback(true);
+    hal::uart1::write_bytes(b"ping").ok();
+    hal::timer::delay_ms(5);
+    while let Some(b) = hal::uart1::read_byte() {
+        writeln!(uart::Uart0, "[uart1 loopback] got byte: {}", b).ok();
+    }
+
     loop {
         hal::timer::delay_ms(50);
     }
