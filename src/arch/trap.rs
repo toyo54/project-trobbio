@@ -30,9 +30,17 @@
 //! (hi/lo, with the retry-on-read and write-hi-as-guard-then-lo-then-hi
 //! patterns), just anchored to `CLINT::PTR` instead of a hardcoded literal.
 //!
-//! `mtvec`/`mie`/`mstatus` aren't memory-mapped peripherals at all — they're
-//! CPU CSRs, which no PAC (this one included) exposes — so those stay as
-//! raw `csrw`/`csrs` inline asm, same as before.
+//! ## riscv crate vs. raw asm
+//! `mcause` decoding goes through `riscv::register::mcause` — unlike CLINT,
+//! `mcause`'s layout (interrupt bit + exception code) is defined by the
+//! standard RISC-V privileged ISA, not vendor-specific, so there's no
+//! address-verification risk the way there was for CLINT; using the crate
+//! here is a pure readability win, confirmed against the exact crate
+//! version pinned in Cargo.lock. `mtvec` and the exception path's MPIE
+//! clear stay as raw `csrw`/`csrc` asm: `mtvec` needs a raw address
+//! computed from a linker symbol, and this version of the `riscv` crate
+//! only generates a *setter* for MPIE (`set_mpie`), not a clearer — there's
+//! no equivalent convenience function to swap in for that one line.
 
 use crate::hal::watchdog::feed_watchdog;
 use core::arch::asm;
@@ -143,6 +151,7 @@ pub fn now() -> u64 {
             let hi1 = core::ptr::read_volatile(clint_reg(MTIME_HI_OFFSET));
             let lo = core::ptr::read_volatile(clint_reg(MTIME_LO_OFFSET));
             let hi2 = core::ptr::read_volatile(clint_reg(MTIME_HI_OFFSET));
+            // check if the timer overflowed during the reads (these are not atomic)
             if hi1 == hi2 {
                 return ((hi1 as u64) << 32) | (lo as u64);
             }
@@ -160,8 +169,7 @@ fn set_next_tick_at(target: u64) {
 }
 
 /// Arms a periodic machine-timer tick every `period_ticks` CLINT ticks
-/// (16 MHz clock, so e.g. 16_000_000 == 1 second), points mtvec at the
-/// vector table, and globally enables interrupts. Call once from `main`.
+/// (16 MHz clock, so e.g. 16_000_000 == 1 second), must be called once.
 ///
 /// This tick doubles as the watchdog-feed cadence (see the module docs) —
 /// if you later enable the real hardware watchdog via
@@ -172,16 +180,6 @@ fn set_next_tick_at(target: u64) {
 /// handler doesn't need to touch mtimecmp itself, and doesn't need to feed
 /// the watchdog either; that part is guaranteed by the kernel already.
 pub fn init_periodic_timer(period_ticks: u64) {
-    unsafe extern "C" {
-        fn _vector_table();
-    }
-
-    unsafe {
-        // mtvec bit0 = 1 selects vectored mode; hardware forces this anyway.
-        let vec_addr = (_vector_table as usize) | 1;
-        asm!("csrw mtvec, {0}", in(reg) vec_addr);
-    }
-
     unsafe {
         PERIOD_TICKS = period_ticks;
     }
@@ -209,15 +207,10 @@ pub fn init_periodic_timer(period_ticks: u64) {
 /// functions it calls out to.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_trap_handler() {
-    let cause: usize;
-    unsafe { asm!("csrr {}, mcause", out(reg) cause) };
-
-    let is_interrupt = (cause & 0x8000_0000) != 0;
-    let id = cause & 0x7FFF_FFFF;
-
-    match is_interrupt {
-        true => dispatch_interrupt(id),
-        false => dispatch_exception(cause),
+    let mcause = riscv::register::mcause::read();
+    match mcause.is_interrupt() {
+        true => dispatch_interrupt(mcause.code()),
+        false => dispatch_exception(mcause.bits()),
     }
 }
 
