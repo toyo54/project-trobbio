@@ -18,29 +18,6 @@
 //! Verified against the real esp32c6 v0.23.2 PAC source, same as CLINT:
 //! `clk_conf().sclk_sel()`'s doc comment confirms `1 == 80MHz (APB) clock`,
 //! which is the one field value here I couldn't otherwise be fully sure of.
-//!
-//! ## reg_update: deliberately NOT added here, unlike UART1
-//! UART1 needed (and got, plus a PCR-level clock-enable it was also
-//! missing) a `reg_update` handshake after `clkdiv`/`conf0` writes, since
-//! those are synchronized registers that otherwise sit in an unlatched
-//! shadow copy. UART0 almost certainly has the exact same hardware
-//! behavior — but adding it here on real hardware produced garbled
-//! console output immediately, meaning our baud-rate math (the 80MHz APB
-//! assumption, the clkdiv/frag calculation) has never actually been
-//! proven correct on this specific instance: without reg_update, these
-//! writes were silently absorbed into a shadow register and never took
-//! effect, so the console was running the entire time on whatever the
-//! ROM bootloader had already configured (115200 8N1), independent of
-//! this code. Adding reg_update finally let our own config take effect —
-//! and exposed that it's wrong here specifically, for reasons not yet
-//! isolated (UART1's identical-in-structure math tested clean).
-//!
-//! Given this is the reserved debug channel and real-hardware iteration
-//! is precious, reg_update stays OUT here until the underlying baud math
-//! is verified correct some other way (e.g. cross-testing against UART1
-//! with loopback off, real wire, both sides independently clocked) —
-//! restoring known-if-coincidental working behavior over "correct but
-//! currently broken."
 
 use super::timer;
 use esp32c6::UART0;
