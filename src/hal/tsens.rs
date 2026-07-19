@@ -4,19 +4,12 @@
 //! degrees Celsius. Real ESP-IDF conversion to °C depends on per-chip
 //! eFuse calibration constants and the selected clk_div measurement
 //! range that I have not verified — presenting an uncalibrated formula as
-//! "temperature in °C" would just be a confident-sounding guess, so this
-//! doesn't do that. The raw code IS monotonic with temperature for a
-//! fixed clk_div, though, which is all eco-scheduling actually needs: a
-//! relative "hotter vs. cooler" signal, not an absolute reading.
+//! "temperature in °C" would just be a  guess, so this doesn't do that.
+//! The raw code IS monotonic with temperature for a fixed clk_div.
 //!
 //! Verified against ESP-IDF's actual temperature_sensor_ll.h /
-//! temperature_sensor.c (esp32c6), not guessed:
+//! temperature_sensor.c (esp32c6):
 //! - Reset is a PULSE (`tsens_rst_en = 1` then `= 0`), not a held level.
-//!   The first version of this file set it to 1 and left it there —
-//!   plausibly holding the sensor in permanent reset, which alone would
-//!   explain a flat, never-changing raw reading.
-//! - There's a separate "start sampling" bit (`tsens_sample.en`) beyond
-//!   power-up (`pu`) that the first version never set at all.
 //! - The real driver waits ~300us after enabling before the reading
 //!   settles ("output value gradually approaches the true temperature
 //!   value as measurement time increases").
@@ -59,8 +52,6 @@ pub fn init() {
     // register), which matches ESP-IDF's own comment on this field
     // ("suggest just keep it as default value 6... only used in legacy
     // driver") — the current, non-legacy driver never sets it at all.
-    // The first version of this file overrode it to 10 for no verified
-    // reason; that's removed.
     saradc.tsens_ctrl().modify(|_, w| w.pu().set_bit());
 
     // Separate from `pu` — this is the actual "start sampling" trigger.
@@ -68,12 +59,7 @@ pub fn init() {
 
     // The real driver's own comment: output "gradually approaches the
     // true temperature value as measurement time increases" — ~300us
-    // before the first reading is meaningful. Baked in here rather than
-    // left as a caller responsibility: every other hal:: module fully
-    // brings its peripheral up in one call with no required follow-up
-    // step, and there's nothing about this delay a caller could
-    // meaningfully act on anyway.
-    super::timer::delay_us(300);
+    // before the first reading is meaningful.     super::timer::delay_us(300);
 }
 
 /// Raw 8-bit sensor code. Monotonic with die temperature for a fixed
