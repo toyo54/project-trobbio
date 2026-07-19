@@ -238,10 +238,11 @@ fn handle_machine_timer() {
 
 /// Looks up and runs whatever's registered for `id`, if anything.
 fn call_registered(id: usize) {
-    if id < NUM_IDS {
-        if let Some(handler) = unsafe { HANDLERS[id] } {
-            handler();
-        }
+    if id >= NUM_IDS {
+        return;
+    }
+    if let Some(handler) = unsafe { HANDLERS[id] } {
+        handler();
     }
 }
 
