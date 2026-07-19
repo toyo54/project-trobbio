@@ -5,9 +5,8 @@
 use crate::{
     arch::trap::{self, InterruptId},
     drivers::ws2812::RgbLed,
-    hal::{gpio::GpioPin, timer, uart, watchdog::feed_watchdog},
+    hal::{gpio::GpioPin, watchdog::feed_watchdog},
 };
-use core::fmt::Write as _;
 use core::{arch::global_asm, panic::PanicInfo};
 
 mod arch;
@@ -18,7 +17,7 @@ global_asm!(include_str!("boot.s"));
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    writeln!(uart::Uart0, "PANIC: {}", _info).ok();
+    error!("PANIC: {}", _info);
     let mut led = RgbLed::new(GpioPin::new(8, hal::gpio::GpioFunction::Gpio));
     loop {
         feed_watchdog();
@@ -26,25 +25,23 @@ fn panic(_info: &PanicInfo) -> ! {
     }
 }
 
-/// Every machine-timer tick, right after the kernel's own (unconditional)
-/// watchdog feed. Flips the LED green and prints, so both are visible proof
-/// the tick fired.
 fn on_machine_timer() {
     let mut led = RgbLed::new(GpioPin::new(8, hal::gpio::GpioFunction::Gpio));
     led.refresh((0, 5, 0)); // GREEN
-    writeln!(uart::Uart0, "[tick] machine timer fired, watchdog fed").ok();
+    let raw = hal::tsens::read_raw();
+    info!("[tick] watchdog fed, tsens raw = {}", raw);
 }
 
 fn on_other_interrupt() {
     let mut led = RgbLed::new(GpioPin::new(8, hal::gpio::GpioFunction::Gpio));
     led.refresh((5, 5, 0)); // YELLOW
-    writeln!(uart::Uart0, "[irq] unexpected local interrupt fired").ok();
+    warn!("[irq] unexpected local interrupt fired");
 }
 
 fn on_exception(mcause: usize) {
     let mut led = RgbLed::new(GpioPin::new(8, hal::gpio::GpioFunction::Gpio));
     led.refresh((5, 0, 5)); // PURPLE
-    writeln!(uart::Uart0, "[exception] mcause = 0x{:08x}", mcause).ok();
+    error!("[exception] mcause = 0x{:08x}", mcause);
 }
 
 #[unsafe(no_mangle)]
@@ -53,8 +50,10 @@ pub extern "C" fn main() -> ! {
     // hal::watchdog::disable_hp_watchdog();
     hal::timer::systimer_enable();
 
-    uart::init(115200);
-    writeln!(uart::Uart0, "\r\n--- project-trobbio booting ---").ok();
+    hal::uart::init(115200);
+    info!("--- project-trobbio booting ---");
+
+    hal::tsens::init();
 
     trap::register(InterruptId::MachineTimer, on_machine_timer);
     trap::register(InterruptId::UserSoftware, on_other_interrupt);
@@ -65,18 +64,20 @@ pub extern "C" fn main() -> ! {
     // CLINT runs at 16 MHz, so 16_000_000 ticks == 1 second between fires.
     trap::init_periodic_timer(16_000_000);
 
-    writeln!(uart::Uart0, "boot complete, entering idle loop").ok();
+    info!("boot complete, entering idle loop");
 
-    // Tests uart1
-    hal::uart1::init(4, 5, 115200);
-    hal::uart1::set_loopback(true);
-    hal::uart1::write_bytes(b"ping").ok();
-    hal::timer::delay_ms(5);
-    while let Some(b) = hal::uart1::read_byte() {
-        writeln!(uart::Uart0, "[uart1 loopback] got byte: {}", b).ok();
-    }
+    // UART1 on GPIO10 (TX) / GPIO11 (RX)
+    // Also hardware-tested with an external TX->RX jumper, clean and repeatable.
+    hal::uart1::init(10, 11, 115200);
+    hal::uart1::set_loopback(true); // if disabled, the 2 physical pins must be connected via
+    // jumpers
 
     loop {
-        hal::timer::delay_ms(50);
+        hal::uart1::write_bytes(b"test").ok();
+        hal::timer::delay_ms(100);
+        while let Some(b) = hal::uart1::read_byte() {
+            info!("Loopback success: {}", b as char);
+        }
+        hal::timer::delay_ms(1000);
     }
 }
