@@ -1,11 +1,22 @@
 //! Digital temperature sensor (TSENS) — minimal driver.
 //!
 //! IMPORTANT: this reads the sensor's RAW output code, not calibrated
-//! degrees Celsius. Real ESP-IDF conversion to °C depends on per-chip
-//! eFuse calibration constants and the selected clk_div measurement
-//! range that I have not verified — presenting an uncalibrated formula as
-//! "temperature in °C" would just be a  guess, so this doesn't do that.
-//! The raw code IS monotonic with temperature for a fixed clk_div.
+//! degrees Celsius. TRM 39.3 gives the conversion formula:
+//!
+//!   T(°C) = 0.4386 * VALUE - 27.88 * offset - 20.52
+//!
+//! `offset` is a fixed constant per measurement range (TRM Table
+//! 39.3-1), NOT eFuse data. The real blocker is that this driver never
+//! selects a range in the first place — that requires writing the DAC
+//! bias via temperature_sensor_ll_set_range() in REGI2C, an internal
+//! bit-banged config bus for analog blocks that isn't memory-mapped, so
+//! it's invisible to the PAC (needs MODEM_LPCON's analog-I2C-master
+//! clock, a PMU reset/enable sequence, and the bit-banged transaction
+//! itself — a separate subsystem, not attempted here). Without a known
+//! range, applying the formula with a guessed offset would just be
+//! presenting an assumption as a calibrated reading, so this doesn't do
+//! that. The raw code IS monotonic with temperature for a fixed clk_div,
+//! which is enough for scheduler thresholding.
 //!
 //! Verified against ESP-IDF's actual temperature_sensor_ll.h /
 //! temperature_sensor.c (esp32c6):
@@ -13,32 +24,17 @@
 //! - The real driver waits ~300us after enabling before the reading
 //!   settles ("output value gradually approaches the true temperature
 //!   value as measurement time increases").
-//!
-//! Still NOT implementable from the PAC alone, and not attempted here:
-//! calibrating the sensor's measurement range/DAC bias
-//! (`temperature_sensor_ll_set_range`) requires writing through REGI2C —
-//! an internal bit-banged I2C-style config bus for analog blocks that
-//! isn't a memory-mapped peripheral at all, so it's invisible to the PAC.
-//! Real ESP-IDF needs three more pieces to do this: enabling MODEM_LPCON's
-//! analog-I2C-master clock, a specific PMU register reset/enable pulse
-//! sequence, and the actual bit-banged read/write transaction over a
-//! dedicated internal bus. That's a real, separate subsystem — not
-//! something to bolt on quickly. Without it, this sensor may still not
-//! read a properly-calibrated value even after the fixes below; it's an
-//! honest open gap, not something papered over here.
 
 use esp32c6::{APB_SARADC, PCR};
 
 pub fn init() {
     let pcr = unsafe { PCR::steal() };
-
     pcr.tsens_clk_conf().modify(|_, w| {
         w.tsens_clk_sel()
             .clear_bit() // 0 = internal FOSC, no XTAL dependency
             .tsens_clk_en()
             .set_bit()
     });
-
     // Reset is a PULSE, not a held level — matches
     // temperature_sensor_ll_reset_module() exactly.
     pcr.tsens_clk_conf()
@@ -47,11 +43,7 @@ pub fn init() {
         .modify(|_, w| w.tsens_rst_en().clear_bit());
 
     let saradc = unsafe { APB_SARADC::steal() };
-    // clk_div deliberately untouched: its hardware reset value is 6
-    // (decoded from the PAC's own reset value 0x0001_8080 for this
-    // register), which matches ESP-IDF's own comment on this field
-    // ("suggest just keep it as default value 6... only used in legacy
-    // driver") — the current, non-legacy driver never sets it at all.
+
     saradc.tsens_ctrl().modify(|_, w| w.pu().set_bit());
 
     // Separate from `pu` — this is the actual "start sampling" trigger.
@@ -59,7 +51,8 @@ pub fn init() {
 
     // The real driver's own comment: output "gradually approaches the
     // true temperature value as measurement time increases" — ~300us
-    // before the first reading is meaningful.     super::timer::delay_us(300);
+    // before the first reading is meaningful.
+    super::timer::delay_us(300);
 }
 
 /// Raw 8-bit sensor code. Monotonic with die temperature for a fixed
