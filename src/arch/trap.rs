@@ -135,7 +135,7 @@ pub fn register(id: InterruptId, handler: Handler) {
     });
 }
 
-/// Registers a handler for anything that traps as an exception
+/// Registers a handler for anything that traps as a genuine exception
 /// (`mcause` with the interrupt bit clear). Defaults to clearing MPIE if
 /// nothing is registered.
 pub fn set_exception_handler(handler: ExceptionHandler) {
@@ -151,7 +151,6 @@ pub fn now() -> u64 {
             let hi1 = core::ptr::read_volatile(clint_reg(MTIME_HI_OFFSET));
             let lo = core::ptr::read_volatile(clint_reg(MTIME_LO_OFFSET));
             let hi2 = core::ptr::read_volatile(clint_reg(MTIME_HI_OFFSET));
-            // check if the timer overflowed during the reads (these are not atomic)
             if hi1 == hi2 {
                 return ((hi1 as u64) << 32) | (lo as u64);
             }
@@ -169,7 +168,13 @@ fn set_next_tick_at(target: u64) {
 }
 
 /// Arms a periodic machine-timer tick every `period_ticks` CLINT ticks
-/// (16 MHz clock, so e.g. 16_000_000 == 1 second), must be called once.
+/// (16 MHz clock, so e.g. 16_000_000 == 1 second) and globally enables
+/// interrupts. Call once from `main`.
+///
+/// Doesn't touch `mtvec`: `boot.s`'s `_start` already points it at
+/// `_vector_table` (vectored, same computation this function used to
+/// redo) before `main()` is ever reached, so setting it again here was
+/// dead weight — this is now the single place that does it.
 ///
 /// This tick doubles as the watchdog-feed cadence (see the module docs) —
 /// if you later enable the real hardware watchdog via
@@ -185,7 +190,7 @@ pub fn init_periodic_timer(period_ticks: u64) {
     }
     set_next_tick_at(now() + period_ticks);
 
-    // MTIMECTL is a 32-bit register with real bitfields (MTCE,
+    // MTIMECTL is a genuinely 32-bit register with real bitfields (MTCE,
     // MTIE, ...), no torn-access risk — use the PAC normally here.
     let clint = unsafe { CLINT::steal() };
     clint
@@ -202,43 +207,54 @@ pub fn init_periodic_timer(period_ticks: u64) {
     }
 }
 
-/// Called from the assembly trap entry (`boot.s`) on every trap. Nothing
-/// but decode-and-dispatch lives here — all actual work happens in the
-/// functions it calls out to.
+/// Called from the assembly trap entry (`boot.s`) on every trap. `sp` is
+/// the just-saved current task's stack pointer; the return value is what
+/// `boot.s` loads back into `sp` before restoring registers and `mret`ing
+/// — returning the same value it was given is a null switch (Stage 1);
+/// returning something else is a real context switch (Stage 2).
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_trap_handler() {
+pub extern "C" fn rust_trap_handler(sp: usize) -> usize {
     let mcause = riscv::register::mcause::read();
     match mcause.is_interrupt() {
-        true => dispatch_interrupt(mcause.code()),
-        false => dispatch_exception(mcause.bits()),
+        true => dispatch_interrupt(mcause.code(), sp),
+        false => {
+            dispatch_exception(mcause.bits());
+            sp
+        }
     }
 }
 
 /// Routes a local interrupt ID to its handler. `MachineTimer` gets the
 /// kernel's own reserved handling first; everything else goes straight to
-/// whatever's registered.
-fn dispatch_interrupt(id: usize) {
+/// whatever's registered (and is a null switch — only the reserved tick
+/// drives scheduling right now).
+fn dispatch_interrupt(id: usize, sp: usize) -> usize {
     match id {
-        id if id == InterruptId::MachineTimer as usize => handle_machine_timer(),
-        id => call_registered(id),
+        id if id == InterruptId::MachineTimer as usize => handle_machine_timer(sp),
+        id => {
+            call_registered(id);
+            sp
+        }
     }
 }
 
 /// The reserved machine-timer tick: rearm the next fire, feed the watchdog
 /// unconditionally (see the module docs — this can't be skipped or
-/// forgotten), then let app code piggyback via its own registered handler.
-fn handle_machine_timer() {
+/// forgotten), let app code piggyback via its own registered handler, and
+/// only then ask the scheduler what should run next.
+fn handle_machine_timer(sp: usize) -> usize {
     let period = unsafe { PERIOD_TICKS };
     if period != 0 {
         set_next_tick_at(now() + period);
     }
     feed_watchdog();
     call_registered(InterruptId::MachineTimer as usize);
+    crate::arch::sched::next_sp(sp)
 }
 
 /// Looks up and runs whatever's registered for `id`, if anything.
 fn call_registered(id: usize) {
-    if id >= NUM_IDS {
+    if id > NUM_IDS {
         return;
     }
     if let Some(handler) = unsafe { HANDLERS[id] } {
@@ -246,7 +262,7 @@ fn call_registered(id: usize) {
     }
 }
 
-/// Routes an exception (mcause interrupt bit clear) to whatever's
+/// Routes a genuine exception (mcause interrupt bit clear) to whatever's
 /// registered, falling back to clearing MPIE if nothing is.
 fn dispatch_exception(cause: usize) {
     match unsafe { EXCEPTION_HANDLER } {
