@@ -150,7 +150,7 @@ macro_rules! error {
 }
 
 #[macro_export]
-macro_rules! warn {
+macro_rules! warning {
     ($($arg:tt)*) => {{
         use core::fmt::Write as _;
         let _ = writeln!(
