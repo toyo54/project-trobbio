@@ -3,7 +3,10 @@
 #![no_main]
 
 use crate::{
-    arch::trap::{self, InterruptId},
+    arch::{
+        sched,
+        trap::{self, InterruptId},
+    },
     drivers::ws2812::RgbLed,
     hal::{gpio::GpioPin, watchdog::feed_watchdog},
 };
@@ -35,13 +38,40 @@ fn on_machine_timer() {
 fn on_other_interrupt() {
     let mut led = RgbLed::new(GpioPin::new(8, hal::gpio::GpioFunction::Gpio));
     led.refresh((5, 5, 0)); // YELLOW
-    warn!("[irq] unexpected local interrupt fired");
+    warning!("[irq] unexpected local interrupt fired");
 }
 
 fn on_exception(mcause: usize) {
     let mut led = RgbLed::new(GpioPin::new(8, hal::gpio::GpioFunction::Gpio));
     led.refresh((5, 0, 5)); // PURPLE
     error!("[exception] mcause = 0x{:08x}", mcause);
+}
+
+fn task1() {
+    loop {
+        debug!("Task 1 running");
+        hal::timer::delay_ms(500);
+    }
+}
+
+fn task2() {
+    // used to test stack canary
+    // let _ = core::hint::black_box(consume_stack(u32::MAX));
+    loop {
+        debug!("Task 2 running");
+        hal::timer::delay_ms(500);
+    }
+}
+
+#[inline(never)]
+fn consume_stack(n: u32) -> u32 {
+    let mut buf = [0u8; 64];
+    core::hint::black_box(&mut buf); // forces a real stack frame per call
+    if n == 0 {
+        0
+    } else {
+        1 + consume_stack(n - 1) // the `1 +` makes this NOT a tail call
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -63,9 +93,16 @@ pub extern "C" fn main() -> ! {
 
     // CLINT runs at 16 MHz, so 16_000_000 ticks == 1 second between fires.
     trap::init_periodic_timer(16_000_000);
+    sched::init();
 
     info!("boot complete, entering idle loop");
 
+    // Task builder test here
+    sched::TaskBuilder::new(task1)
+        .priority(sched::Priority::Low)
+        .spawn()
+        .expect("Failed to spawn task1");
+    sched::spawn(task2).expect("Failed to spawn task2");
     // UART1 on GPIO10 (TX) / GPIO11 (RX)
     // Also hardware-tested with an external TX->RX jumper, clean and repeatable.
     hal::uart1::init(10, 11, 115200);
