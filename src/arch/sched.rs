@@ -126,11 +126,10 @@ pub fn spawn(entry: fn()) -> Result<usize, ()> {
 
 /// Optional explicit control over a task's priority at spawn time.
 /// `sched::spawn(f)` still works unchanged for the common case (defaults
-/// to Normal); reach for this when a task genuinely is more or less
+/// to Normal); reach for this when a task is more or less
 /// important than the rest -- that's a fact only you, the task's author,
-/// can supply. It's not something the scheduler can infer on its own
-/// (see the power-estimation question this came from: no honest way to
-/// derive "how important is this" from the code alone).
+/// can supply. It's not something the scheduler can infer on its own:
+/// no honest way to derive "how important is this" from the code alone.
 pub struct TaskBuilder {
     entry: fn(),
     priority: Priority,
