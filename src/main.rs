@@ -20,12 +20,14 @@ global_asm!(include_str!("boot.s"));
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    error!("PANIC: {}", _info);
-    let mut led = RgbLed::new(GpioPin::new(8, hal::gpio::GpioFunction::Gpio));
-    loop {
-        feed_watchdog();
-        led.refresh((5, 0, 0)); // RED = Panic
+    extern "C" fn log_panic(info_ptr: usize) {
+        // Safety: report_fatal_and_halt only ever calls this with the
+        // address of the PanicInfo passed in below, still alive for the
+        // duration of the call.
+        let info = unsafe { &*(info_ptr as *const PanicInfo) };
+        error!("PANIC: {}", info);
     }
+    arch::trap::report_fatal_and_halt(log_panic, _info as *const PanicInfo as usize)
 }
 
 fn on_machine_timer() {
@@ -56,7 +58,7 @@ fn task1() {
 
 fn task2() {
     // used to test stack canary
-    // let _ = core::hint::black_box(consume_stack(u32::MAX));
+    let _ = core::hint::black_box(consume_stack(u32::MAX));
     loop {
         debug!("Task 2 running");
         hal::timer::delay_ms(500);
@@ -73,6 +75,11 @@ fn consume_stack(n: u32) -> u32 {
         1 + consume_stack(n - 1) // the `1 +` makes this NOT a tail call
     }
 }
+
+// TODO:
+// 1) make the exception code simpler
+// 2) add an API for exception hooks
+// 3) package the kernel inside a single API and call it done
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> ! {
