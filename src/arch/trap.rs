@@ -42,6 +42,9 @@
 //! only generates a *setter* for MPIE (`set_mpie`), not a clearer — there's
 //! no equivalent convenience function to swap in for that one line.
 
+use crate::drivers::ws2812::RgbLed;
+use crate::hal::gpio::{GpioFunction, GpioPin};
+use crate::hal::uart;
 use crate::hal::watchdog::feed_watchdog;
 use core::arch::asm;
 use esp32c6::CLINT;
@@ -135,7 +138,7 @@ pub fn register(id: InterruptId, handler: Handler) {
     });
 }
 
-/// Registers a handler for anything that traps as a genuine exception
+/// Registers a handler for anything that traps as an exception
 /// (`mcause` with the interrupt bit clear). Defaults to clearing MPIE if
 /// nothing is registered.
 pub fn set_exception_handler(handler: ExceptionHandler) {
@@ -190,7 +193,7 @@ pub fn init_periodic_timer(period_ticks: u64) {
     }
     set_next_tick_at(now() + period_ticks);
 
-    // MTIMECTL is a genuinely 32-bit register with real bitfields (MTCE,
+    // MTIMECTL is a 32-bit register with real bitfields (MTCE,
     // MTIE, ...), no torn-access risk — use the PAC normally here.
     let clint = unsafe { CLINT::steal() };
     clint
@@ -217,10 +220,7 @@ pub extern "C" fn rust_trap_handler(sp: usize) -> usize {
     let mcause = riscv::register::mcause::read();
     match mcause.is_interrupt() {
         true => dispatch_interrupt(mcause.code(), sp),
-        false => {
-            dispatch_exception(mcause.bits());
-            sp
-        }
+        false => dispatch_exception(mcause.bits()), // `!` unifies with `usize`
     }
 }
 
@@ -262,13 +262,119 @@ fn call_registered(id: usize) {
     }
 }
 
-/// Routes a genuine exception (mcause interrupt bit clear) to whatever's
-/// registered, falling back to clearing MPIE if nothing is.
-fn dispatch_exception(cause: usize) {
+extern "C" fn run_registered_exception_handler(cause: usize) {
     match unsafe { EXCEPTION_HANDLER } {
         Some(handler) => handler(cause),
         None => unsafe {
             asm!("csrc mstatus, {0}", in(reg) 0x80_usize);
         },
+    }
+}
+
+/// Routes an exception (mcause interrupt bit clear) to whatever's
+/// registered, then halts. Never resumes: see the "Fatal-fault safety
+/// net" section above for why resuming after any hardware exception
+/// can't be assumed safe on this kernel.
+fn dispatch_exception(cause: usize) -> ! {
+    report_fatal_and_halt(run_registered_exception_handler, cause)
+}
+
+/* ===================== Fatal-fault safety net ===================== */
+//
+// An hardware exception (illegal instruction, bad memory access,
+// misaligned access, ...) on this kernel almost always means something
+// is already badly wrong — most commonly a task stack overflow that's
+// trampled straight through its own STACK_CANARY and into whatever sits
+// next to it. By the time we're here, the stack that was active at the
+// moment of the trap can't be trusted for anything: not for the ~128
+// bytes `_trap_handler` already pushed onto it, and definitely not for
+// the deeper calls (`error!`, UART FIFO polling, core::fmt) that
+// reporting the fault needs to make.
+//
+// So: report and halt on a small dedicated stack task code never
+// touches, and guard against the report itself faulting a second time
+// (a real risk if the corruption reaches further than expected) with a
+// one-shot reentrancy flag. If that happens, skip straight to a bare,
+// fixed message instead of trying to log again.
+//
+// Shared by `dispatch_exception` below and the panic handler in
+// main.rs, since both can be reached with the stack already blown.
+
+const EXCEPTION_STACK_SIZE: usize = 512;
+
+#[repr(align(16))]
+struct EmergencyStack([u8; EXCEPTION_STACK_SIZE]);
+static mut EMERGENCY_STACK: EmergencyStack = EmergencyStack([0; EXCEPTION_STACK_SIZE]);
+
+/// Set as soon as we've committed to fault-reporting. Checked so a
+/// second fault *during* reporting is detected instead of looping —
+/// this is exactly what happened before this fix: `error!` inside
+/// `on_exception` faulted again on the still-corrupted stack, re-entered
+/// the trap, and repeated forever.
+static mut FAULT_IN_PROGRESS: bool = false;
+
+/// GPIO8 drives the onboard status LED everywhere else in this project
+/// (see main.rs) — reusing the same pin here on purpose, so the fatal
+/// path lights the exact same LED, not a second independent one.
+const STATUS_LED_PIN: u8 = 8;
+
+fn emergency_stack_top() -> usize {
+    unsafe { (core::ptr::addr_of_mut!(EMERGENCY_STACK) as usize + EXCEPTION_STACK_SIZE) & !0xF }
+}
+
+/// Calls `f(arg)` with `sp` pointed at the emergency stack, then restores
+/// the original `sp` before returning. Deliberately a plain function
+/// pointer + `usize` argument rather than a generic closure, so the sp
+/// swap has no captured environment and nothing for the compiler to
+/// spill onto whichever stack happens to be live at the wrong moment.
+#[inline(never)]
+fn on_emergency_stack(f: extern "C" fn(usize), arg: usize) {
+    let stack_top = emergency_stack_top();
+    let old_sp: usize;
+    unsafe {
+        asm!("mv {0}, sp", out(reg) old_sp);
+        asm!("mv sp, {0}", in(reg) stack_top);
+    }
+    f(arg);
+    unsafe {
+        asm!("mv sp, {0}", in(reg) old_sp);
+    }
+}
+
+/// Common endpoint for both a fatal exception and a Rust panic: try once
+/// (and only once) to report `f(arg)` on the emergency stack, then halt
+/// forever with the status LED red and the watchdog fed. Never returns —
+/// resuming the original context isn't safe to assume once we're here.
+pub fn report_fatal_and_halt(f: extern "C" fn(usize), arg: usize) -> ! {
+    let already_faulting = unsafe {
+        let prev = FAULT_IN_PROGRESS;
+        FAULT_IN_PROGRESS = true;
+        prev
+    };
+
+    if !already_faulting {
+        on_emergency_stack(f, arg);
+    } else {
+        // Reporting itself just faulted a second time — don't try
+        // again, don't touch core::fmt or go through the normal driver
+        // call chain. A bare fixed message is the only remaining ask.
+        let _ = uart::write_bytes(b"\r\n[FATAL] double fault while reporting, halting\r\n");
+    }
+
+    halt_forever()
+}
+
+fn halt_forever() -> ! {
+    // Force sp onto the emergency stack unconditionally, even if we're
+    // already on it — this must not depend on the incoming sp being
+    // anything in particular.
+    unsafe {
+        asm!("mv sp, {0}", in(reg) emergency_stack_top());
+    }
+
+    let mut led = RgbLed::new(GpioPin::new(STATUS_LED_PIN, GpioFunction::Gpio));
+    loop {
+        feed_watchdog();
+        led.refresh((5, 0, 0));
     }
 }
