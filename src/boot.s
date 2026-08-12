@@ -83,12 +83,6 @@ _trap_handler:
     # 80: s4   84: s5   88: s6   92: s7
     # 96: s8  100: s9  104: s10 108: s11
     # 112: mepc                 116-124: unused padding
-    #
-    # Extended from the caller-saved-only frame the cooperative design
-    # needed: preemption can happen at ANY instruction, not just a
-    # voluntary call boundary, so EVERY register plus the resume address
-    # (mepc) has to be captured -- not just what the ABI's callee-saved
-    # convention would otherwise protect for free on a normal return.
     addi sp, sp, -128
     sw ra,  0(sp)
     sw t0,  4(sp)
