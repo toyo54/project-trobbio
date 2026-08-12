@@ -13,34 +13,11 @@
 //! because some app-level handler forgot to feed it, panicked, or was never
 //! wired up.
 //!
-//! ## PAC vs. raw addresses
-//! CLINT peripheral access goes through `esp32c6::CLINT` (confirmed against
-//! esp32c6 v0.23.2: `CLINT::PTR == 0x2000_0000`, matching TRM Table 1.4-1's
-//! "CPU Sub-system region", with `MTIMECTL`/`MTIME`/`MTIMECMP` at the same
-//! 0x1804/0x1808/0x1810 offsets TRM 1.7.5/1.7.6 gives). `MTIMECTL` uses the
-//! PAC's normal field accessors.
-//!
-//! `MTIME`/`MTIMECMP` are the exception: the PAC models both as single
-//! 64-bit registers, but RV32 has no atomic 64-bit load/store, so a `u64`
-//! volatile access there quietly becomes two separate 32-bit accesses with
-//! no ordering guarantee — a read can tear if the low word wraps mid-read
-//! (~every 268s at 16MHz), and a naive write can briefly present a
-//! mismatched (old-hi, new-lo) pair, risking a spurious early compare
-//! match. Both registers are still accessed at 32-bit granularity here
-//! (hi/lo, with the retry-on-read and write-hi-as-guard-then-lo-then-hi
-//! patterns), just anchored to `CLINT::PTR` instead of a hardcoded literal.
-//!
-//! ## riscv crate vs. raw asm
-//! `mcause` decoding goes through `riscv::register::mcause` — unlike CLINT,
-//! `mcause`'s layout (interrupt bit + exception code) is defined by the
-//! standard RISC-V privileged ISA, not vendor-specific, so there's no
-//! address-verification risk the way there was for CLINT; using the crate
-//! here is a pure readability win, confirmed against the exact crate
-//! version pinned in Cargo.lock. `mtvec` and the exception path's MPIE
-//! clear stay as raw `csrw`/`csrc` asm: `mtvec` needs a raw address
-//! computed from a linker symbol, and this version of the `riscv` crate
-//! only generates a *setter* for MPIE (`set_mpie`), not a clearer — there's
-//! no equivalent convenience function to swap in for that one line.
+//! Whether this tick ALSO drives scheduling is a runtime decision, made via
+//! `KernelBuilder::scheduler()` -> `set_sched_enabled()`. When disabled, the
+//! tick still fires, still feeds the watchdog, still runs whatever's
+//! registered on `MachineTimer` — it just returns the same `sp` it was
+//! given (a null switch), same as any other interrupt.
 
 use crate::drivers::ws2812::RgbLed;
 use crate::hal::gpio::{GpioFunction, GpioPin};
@@ -49,22 +26,15 @@ use crate::hal::watchdog::feed_watchdog;
 use core::arch::asm;
 use esp32c6::CLINT;
 
-// MTIME/MTIMECMP need 32-bit-granularity access (see module docs) that the
-// PAC's u64-typed accessors don't give us. We'd like these as `const`
-// pointers anchored to CLINT::PTR, but rustc's const evaluator flatly
-// refuses pointer-to-integer casts at compile time ("pointers cannot be
-// cast to integers during const eval") — even though CLINT::PTR's value is
-// in fact fixed, the const evaluator doesn't reason about that. So the
-// *offsets* are consts (plain integers, no pointer arithmetic involved),
-// and the pointer itself is computed at runtime by `clint_reg()` below.
 const MTIME_LO_OFFSET: usize = 0x1808;
 const MTIME_HI_OFFSET: usize = 0x180C;
 const MTIMECMP_LO_OFFSET: usize = 0x1810;
 const MTIMECMP_HI_OFFSET: usize = 0x1814;
 
-/// Computes a pointer to a byte offset inside the CLINT block, anchored to
-/// the PAC's own `CLINT::PTR` — the address itself is still single-sourced
-/// from the PAC, just resolved at runtime instead of compile time.
+// NOTE: On ESP32-C6, the CPU Timer (MTIME) runs at the CPU core frequency,
+// not the 16MHz SYSTIMER frequency. This is typically 40MHz at boot, or 160MHz if PLL is enabled.
+pub const CLINT_HZ: u64 = 40_000_000; // Updated to reflect typical boot speed
+
 #[inline(always)]
 fn clint_reg(offset: usize) -> *mut u32 {
     (CLINT::PTR as *mut u8).wrapping_add(offset) as *mut u32
@@ -88,6 +58,7 @@ pub type ExceptionHandler = fn(mcause: usize);
 
 static mut HANDLERS: [Option<Handler>; NUM_IDS] = [None; NUM_IDS];
 static mut EXCEPTION_HANDLER: Option<ExceptionHandler> = None;
+
 // Not an Atomic: AtomicU64 isn't available on riscv32imac (the RV32 'A'
 // extension only has 32-bit atomics). Safe as a plain static mut because
 // it's written once in init_periodic_timer() before interrupts are ever
@@ -95,21 +66,14 @@ static mut EXCEPTION_HANDLER: Option<ExceptionHandler> = None;
 // be preempted (mstatus.MIE is hardware-cleared for the trap's duration).
 static mut PERIOD_TICKS: u64 = 0;
 
-/// Runs `f` with `mstatus.MIE` forced off, restoring it to whatever it was
-/// before on the way out. This is the software workaround TRM 1.6.3.1
-/// recommends whenever touching Interrupt Controller (INTC/INTPRI)
-/// registers specifically — they take up to 4 cycles to settle into
-/// steady state, and interrupt ordering isn't guaranteed during that
-/// transient window — but it's equally the right tool any time code needs
-/// to touch shared state that a trap handler might also touch (like the
-/// handler tables below).
-///
-/// Nesting-safe: only re-enables MIE on exit if it was actually on before
-/// entry, so a critical_section called from inside another one won't
-/// prematurely flip interrupts back on.
-///
-/// Exposed publicly so driver code (future INTPRI/UART setup included)
-/// doesn't have to hand-roll this sequence itself.
+static mut SCHED_ENABLED: bool = false;
+
+pub(crate) fn set_sched_enabled(enabled: bool) {
+    unsafe {
+        SCHED_ENABLED = enabled;
+    }
+}
+
 pub fn critical_section<R>(f: impl FnOnce() -> R) -> R {
     let saved_mstatus: usize;
     unsafe {
@@ -174,11 +138,6 @@ fn set_next_tick_at(target: u64) {
 /// (16 MHz clock, so e.g. 16_000_000 == 1 second) and globally enables
 /// interrupts. Call once from `main`.
 ///
-/// Doesn't touch `mtvec`: `boot.s`'s `_start` already points it at
-/// `_vector_table` (vectored, same computation this function used to
-/// redo) before `main()` is ever reached, so setting it again here was
-/// dead weight — this is now the single place that does it.
-///
 /// This tick doubles as the watchdog-feed cadence (see the module docs) —
 /// if you later enable the real hardware watchdog via
 /// `hal::watchdog::enable_timg0()`, make sure `period_ticks` here is
@@ -193,8 +152,6 @@ pub fn init_periodic_timer(period_ticks: u64) {
     }
     set_next_tick_at(now() + period_ticks);
 
-    // MTIMECTL is a 32-bit register with real bitfields (MTCE,
-    // MTIE, ...), no torn-access risk — use the PAC normally here.
     let clint = unsafe { CLINT::steal() };
     clint
         .mtimectl()
@@ -202,10 +159,7 @@ pub fn init_periodic_timer(period_ticks: u64) {
 
     unsafe {
         asm!("fence");
-
-        // mie bit 7 = MTIE, unmasks the machine timer interrupt at core level.
         asm!("csrs mie, {0}", in(reg) 0x80_usize);
-        // mstatus bit 3 = MIE, the global machine-interrupt enable.
         asm!("csrs mstatus, {0}", in(reg) 0x8_usize);
     }
 }
@@ -220,7 +174,7 @@ pub extern "C" fn rust_trap_handler(sp: usize) -> usize {
     let mcause = riscv::register::mcause::read();
     match mcause.is_interrupt() {
         true => dispatch_interrupt(mcause.code(), sp),
-        false => dispatch_exception(mcause.bits()), // `!` unifies with `usize`
+        false => dispatch_exception(mcause.bits()),
     }
 }
 
@@ -229,12 +183,11 @@ pub extern "C" fn rust_trap_handler(sp: usize) -> usize {
 /// whatever's registered (and is a null switch — only the reserved tick
 /// drives scheduling right now).
 fn dispatch_interrupt(id: usize, sp: usize) -> usize {
-    match id {
-        id if id == InterruptId::MachineTimer as usize => handle_machine_timer(sp),
-        id => {
-            call_registered(id);
-            sp
-        }
+    if id == InterruptId::MachineTimer as usize {
+        handle_machine_timer(sp)
+    } else {
+        call_registered(id);
+        sp
     }
 }
 
@@ -245,18 +198,26 @@ fn dispatch_interrupt(id: usize, sp: usize) -> usize {
 fn handle_machine_timer(sp: usize) -> usize {
     let period = unsafe { PERIOD_TICKS };
     if period != 0 {
+        // interrupt storms if the CPU ever gets bogged down and misses a tick.
         set_next_tick_at(now() + period);
     }
+
     feed_watchdog();
     call_registered(InterruptId::MachineTimer as usize);
-    crate::arch::sched::next_sp(sp)
+
+    if unsafe { SCHED_ENABLED } {
+        crate::arch::sched::next_sp(sp)
+    } else {
+        sp
+    }
 }
 
 /// Looks up and runs whatever's registered for `id`, if anything.
 fn call_registered(id: usize) {
-    if id > NUM_IDS {
+    if id >= NUM_IDS {
         return;
     }
+
     if let Some(handler) = unsafe { HANDLERS[id] } {
         handler();
     }
@@ -272,7 +233,9 @@ extern "C" fn run_registered_exception_handler(cause: usize) {
 }
 
 /// Routes an exception (mcause interrupt bit clear) to whatever's
-/// registered, then halts. Never resumes: see the "Fatal-fault safety
+/// registered, then halts.
+
+//  Never resumes: see the "Fatal-fault safety
 /// net" section above for why resuming after any hardware exception
 /// can't be assumed safe on this kernel.
 fn dispatch_exception(cause: usize) -> ! {
@@ -280,25 +243,6 @@ fn dispatch_exception(cause: usize) -> ! {
 }
 
 /* ===================== Fatal-fault safety net ===================== */
-//
-// An hardware exception (illegal instruction, bad memory access,
-// misaligned access, ...) on this kernel almost always means something
-// is already badly wrong — most commonly a task stack overflow that's
-// trampled straight through its own STACK_CANARY and into whatever sits
-// next to it. By the time we're here, the stack that was active at the
-// moment of the trap can't be trusted for anything: not for the ~128
-// bytes `_trap_handler` already pushed onto it, and definitely not for
-// the deeper calls (`error!`, UART FIFO polling, core::fmt) that
-// reporting the fault needs to make.
-//
-// So: report and halt on a small dedicated stack task code never
-// touches, and guard against the report itself faulting a second time
-// (a real risk if the corruption reaches further than expected) with a
-// one-shot reentrancy flag. If that happens, skip straight to a bare,
-// fixed message instead of trying to log again.
-//
-// Shared by `dispatch_exception` below and the panic handler in
-// main.rs, since both can be reached with the stack already blown.
 
 const EXCEPTION_STACK_SIZE: usize = 512;
 
@@ -306,16 +250,8 @@ const EXCEPTION_STACK_SIZE: usize = 512;
 struct EmergencyStack([u8; EXCEPTION_STACK_SIZE]);
 static mut EMERGENCY_STACK: EmergencyStack = EmergencyStack([0; EXCEPTION_STACK_SIZE]);
 
-/// Set as soon as we've committed to fault-reporting. Checked so a
-/// second fault *during* reporting is detected instead of looping —
-/// this is exactly what happened before this fix: `error!` inside
-/// `on_exception` faulted again on the still-corrupted stack, re-entered
-/// the trap, and repeated forever.
 static mut FAULT_IN_PROGRESS: bool = false;
 
-/// GPIO8 drives the onboard status LED everywhere else in this project
-/// (see main.rs) — reusing the same pin here on purpose, so the fatal
-/// path lights the exact same LED, not a second independent one.
 const STATUS_LED_PIN: u8 = 8;
 
 fn emergency_stack_top() -> usize {
@@ -323,10 +259,11 @@ fn emergency_stack_top() -> usize {
 }
 
 /// Calls `f(arg)` with `sp` pointed at the emergency stack, then restores
-/// the original `sp` before returning. Deliberately a plain function
-/// pointer + `usize` argument rather than a generic closure, so the sp
-/// swap has no captured environment and nothing for the compiler to
-/// spill onto whichever stack happens to be live at the wrong moment.
+/// the original `sp` before returning.
+///
+/// Deliberately a plain function pointer + `usize` argument rather than
+///  a generic closure, so the sp swap has no captured environment and nothing for
+///  the compiler to spill onto whichever stack happens to be live at the wrong moment.
 #[inline(never)]
 fn on_emergency_stack(f: extern "C" fn(usize), arg: usize) {
     let stack_top = emergency_stack_top();
