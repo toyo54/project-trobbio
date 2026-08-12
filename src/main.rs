@@ -58,7 +58,7 @@ fn task1() {
 
 fn task2() {
     // used to test stack canary
-    let _ = core::hint::black_box(consume_stack(u32::MAX));
+    // let _ = core::hint::black_box(consume_stack(u32::MAX));
     loop {
         debug!("Task 2 running");
         hal::timer::delay_ms(500);

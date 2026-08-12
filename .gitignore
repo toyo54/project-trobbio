@@ -15,3 +15,4 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+.DS_Store
