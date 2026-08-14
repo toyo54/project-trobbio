@@ -61,6 +61,7 @@ SECTIONS {
     }
 }
 
+
 /* --- Safety Assertions --- */
 
 /* 1. Ensure the Stack doesn't overflow into BSS/Data */
@@ -74,3 +75,10 @@ ASSERT((_ebss % 4) == 0, "BUG: .bss end is not 4-byte aligned");
 
 /* 3. Ensure the RISC-V global pointer is defined for relative addressing */
 ASSERT(DEFINED(__global_pointer$), "BUG: RISC-V __global_pointer$ is missing");
+
+/* 4. main's stack is hardcoded in boot.s as `li sp, 0x40860000`, NOT derived
+      from _stack_size/RAM above — this assert is the only thing standing
+      between task .bss growth (STACKS array etc.) and silently colliding
+      with that hardcoded boot stack, since check #1 only protects against
+      running off the *end* of RAM, not against this separate fixed address. */
+ASSERT(_ebss <= 0x40860000, "BUG: .bss has grown into the hardcoded boot stack region (0x40860000)");
