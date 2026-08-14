@@ -1,6 +1,6 @@
 use esp32c6::{GPIO, IO_MUX};
 
-pub const GPIO_COUNT: u8 = 30;
+pub const GPIO_COUNT: u8 = 31;
 
 /// Selects wich internal function is routed to a GPIO pin via IO_MUX.
 /// This maps to the `mcu_sel` field in the IO_MUX register
