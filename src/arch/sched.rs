@@ -64,8 +64,11 @@ fn check_canary(id: usize) -> bool {
     }
 }
 
-const MAX_TASKS: usize = 4;
+const MAX_TASKS: usize = 17;
 const STACK_SIZE: usize = 2048;
+
+// (MAX_TASKS - 1) * STACK_SIZE = 16 * 2048 = 32 Kb
+//             ^^^ exclude main
 
 static mut STACKS: [[u8; STACK_SIZE]; MAX_TASKS - 1] = [[0; STACK_SIZE]; MAX_TASKS - 1];
 static mut SAVED_SP: [usize; MAX_TASKS] = [0; MAX_TASKS];
