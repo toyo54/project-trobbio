@@ -294,7 +294,7 @@ pub fn report_fatal_and_halt(f: extern "C" fn(usize), arg: usize) -> ! {
     } else {
         // Reporting itself just faulted a second time — don't try
         // again, don't touch core::fmt or go through the normal driver
-        // call chain. A bare fixed message is the only remaining ask.
+        // call chain. A bare fixed message is the only thing worth trying.
         let _ = uart::write_bytes(b"\r\n[FATAL] double fault while reporting, halting\r\n");
     }
 
