@@ -18,6 +18,47 @@
 //! tick still fires, still feeds the watchdog, still runs whatever's
 //! registered on `MachineTimer` — it just returns the same `sp` it was
 //! given (a null switch), same as any other interrupt.
+//!
+//! ## Exceptions: fatal vs. voluntary yield
+//! Almost every exception on this chip is treated as fatal and routed to
+//! `report_fatal_and_halt` — illegal instructions, misaligned/faulting
+//! accesses, all of it. The single deliberate exception to that rule is
+//! `ECALL_FROM_M` (M-mode `ecall`), which `yield_now()` triggers on purpose
+//! to force an immediate, synchronous reschedule instead of waiting for the
+//! next timer tick. This is what makes task exit (`sched::task_exited`)
+//! real round-robin instead of a task idling away the rest of its slice in
+//! `wfi`. Every other exception code still halts exactly as before — this
+//! is a narrow, explicit carve-out, not a general loosening of the fault
+//! path.
+//!
+//! ## PAC vs. raw addresses
+//! CLINT peripheral access goes through `esp32c6::CLINT` (confirmed against
+//! esp32c6 v0.23.2: `CLINT::PTR == 0x2000_0000`, matching TRM Table 1.4-1's
+//! "CPU Sub-system region", with `MTIMECTL`/`MTIME`/`MTIMECMP` at the same
+//! 0x1804/0x1808/0x1810 offsets TRM 1.7.5/1.7.6 gives). `MTIMECTL` uses the
+//! PAC's normal field accessors.
+//!
+//! `MTIME`/`MTIMECMP` are the exception: the PAC models both as single
+//! 64-bit registers, but RV32 has no atomic 64-bit load/store, so a `u64`
+//! volatile access there quietly becomes two separate 32-bit accesses with
+//! no ordering guarantee — a read can tear if the low word wraps mid-read
+//! (~every 268s at 16MHz), and a naive write can briefly present a
+//! mismatched (old-hi, new-lo) pair, risking a spurious early compare
+//! match. Both registers are still accessed at 32-bit granularity here
+//! (hi/lo, with the retry-on-read and write-hi-as-guard-then-lo-then-hi
+//! patterns), just anchored to `CLINT::PTR` instead of a hardcoded literal.
+//!
+//! ## riscv crate vs. raw asm
+//! `mcause` decoding goes through `riscv::register::mcause` — unlike CLINT,
+//! `mcause`'s layout (interrupt bit + exception code) is defined by the
+//! standard RISC-V privileged ISA, not vendor-specific, so there's no
+//! address-verification risk the way there was for CLINT; using the crate
+//! here is a pure readability win, confirmed against the exact crate
+//! version pinned in Cargo.lock. `mtvec` and the exception path's MPIE
+//! clear stay as raw `csrw`/`csrc` asm: `mtvec` needs a raw address
+//! computed from a linker symbol, and this version of the `riscv` crate
+//! only generates a *setter* for MPIE (`set_mpie`), not a clearer — there's
+//! no equivalent convenience function to swap in for that one line.
 
 use crate::drivers::ws2812::RgbLed;
 use crate::hal::gpio::{GpioFunction, GpioPin};
@@ -40,10 +81,6 @@ fn clint_reg(offset: usize) -> *mut u32 {
     (CLINT::PTR as *mut u8).wrapping_add(offset) as *mut u32
 }
 
-/// Local CLINT interrupt IDs (TRM Table 1.7-1). These 4 are fixed-priority
-/// and always enabled at the INTC level; everything else (external
-/// peripheral interrupts, IDs 1-2, 5-6, 8-31) would need INTPRI setup too,
-/// which isn't wired up here yet.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InterruptId {
     UserSoftware = 0,
@@ -66,8 +103,21 @@ static mut EXCEPTION_HANDLER: Option<ExceptionHandler> = None;
 // be preempted (mstatus.MIE is hardware-cleared for the trap's duration).
 static mut PERIOD_TICKS: u64 = 0;
 
+/// M-mode ECALL exception code (RISC-V privileged spec, mcause value when
+/// mcause.is_interrupt() is false). This is the exception `yield_now()`
+/// deliberately triggers to force an immediate, synchronous reschedule —
+/// the difference between "real" round-robin and one that wastes the rest
+/// of a dead task's time slice sitting in `wfi`.
+const ECALL_FROM_M: usize = 11;
+
+/// Whether `handle_machine_timer` should hand off to `arch::sched::next_sp`.
+/// Set once by `KernelBuilder::build()` via `set_sched_enabled()`, based on
+/// whether `.scheduler()` was called — a plain runtime flag, not a `cfg`,
+/// since `arch::sched` is always compiled in regardless.
 static mut SCHED_ENABLED: bool = false;
 
+/// Called by `Kernel::builder()...build()`. Not meant to be called directly
+/// by application code.
 pub(crate) fn set_sched_enabled(enabled: bool) {
     unsafe {
         SCHED_ENABLED = enabled;
@@ -174,7 +224,7 @@ pub extern "C" fn rust_trap_handler(sp: usize) -> usize {
     let mcause = riscv::register::mcause::read();
     match mcause.is_interrupt() {
         true => dispatch_interrupt(mcause.code(), sp),
-        false => dispatch_exception(mcause.bits()),
+        false => dispatch_exception(mcause.bits(), sp),
     }
 }
 
@@ -183,25 +233,25 @@ pub extern "C" fn rust_trap_handler(sp: usize) -> usize {
 /// whatever's registered (and is a null switch — only the reserved tick
 /// drives scheduling right now).
 fn dispatch_interrupt(id: usize, sp: usize) -> usize {
-    if id == InterruptId::MachineTimer as usize {
-        handle_machine_timer(sp)
-    } else {
-        call_registered(id);
-        sp
+    match id {
+        id if id == InterruptId::MachineTimer as usize => handle_machine_timer(sp),
+        id => {
+            call_registered(id);
+            sp
+        }
     }
 }
 
 /// The reserved machine-timer tick: rearm the next fire, feed the watchdog
-/// unconditionally (see the module docs — this can't be skipped or
-/// forgotten), let app code piggyback via its own registered handler, and
-/// only then ask the scheduler what should run next.
+/// unconditionally, let app code piggyback via its own registered handler,
+/// then — only if `.scheduler()` was requested at boot — ask the scheduler
+/// what should run next. Otherwise this is a null switch, same as any
+/// other interrupt.
 fn handle_machine_timer(sp: usize) -> usize {
     let period = unsafe { PERIOD_TICKS };
     if period != 0 {
-        // interrupt storms if the CPU ever gets bogged down and misses a tick.
         set_next_tick_at(now() + period);
     }
-
     feed_watchdog();
     call_registered(InterruptId::MachineTimer as usize);
 
@@ -214,10 +264,9 @@ fn handle_machine_timer(sp: usize) -> usize {
 
 /// Looks up and runs whatever's registered for `id`, if anything.
 fn call_registered(id: usize) {
-    if id >= NUM_IDS {
+    if id > NUM_IDS {
         return;
     }
-
     if let Some(handler) = unsafe { HANDLERS[id] } {
         handler();
     }
@@ -232,14 +281,45 @@ extern "C" fn run_registered_exception_handler(cause: usize) {
     }
 }
 
-/// Routes an exception (mcause interrupt bit clear) to whatever's
-/// registered, then halts.
-
-//  Never resumes: see the "Fatal-fault safety
-/// net" section above for why resuming after any hardware exception
-/// can't be assumed safe on this kernel.
-fn dispatch_exception(cause: usize) -> ! {
+/// Routes a caught exception. `ECALL_FROM_M` is the one deliberate,
+/// non-fatal case — see the module docs — and is handled by advancing
+/// `mepc` past the `ecall` and immediately asking the scheduler for the
+/// next task. Every other exception code is fatal.
+fn dispatch_exception(cause: usize, sp: usize) -> usize {
+    if cause == ECALL_FROM_M {
+        return handle_yield(sp);
+    }
     report_fatal_and_halt(run_registered_exception_handler, cause)
+}
+
+/// Handles a voluntary `ecall` yield: advances the saved `mepc` past the
+/// `ecall` instruction (which, unlike a normal instruction, doesn't
+/// auto-advance on trap entry — skipping this would re-execute the same
+/// `ecall` in an infinite loop next time this frame is resumed), then
+/// hands off to the scheduler exactly like a preempting timer tick would.
+fn handle_yield(sp: usize) -> usize {
+    unsafe {
+        // TrapFrame.mepc lives at byte offset 112 in the saved frame
+        // (see the layout comment in boot.s).
+        let mepc_ptr = (sp + 112) as *mut usize;
+        *mepc_ptr += 4;
+    }
+    if unsafe { SCHED_ENABLED } {
+        crate::arch::sched::next_sp(sp)
+    } else {
+        sp
+    }
+}
+
+/// Voluntarily gives up the rest of the current time slice, immediately
+/// switching to the next eligible task instead of waiting for the next
+/// timer tick. Traps via `ecall`, so it goes through the exact same
+/// save/restore path as a preempting interrupt — no separate context-
+/// switch machinery to keep in sync. Used by `sched::task_exited` so a
+/// task that finishes early hands off the CPU immediately, not after
+/// idling out the rest of its slice.
+pub fn yield_now() {
+    unsafe { core::arch::asm!("ecall") };
 }
 
 /* ===================== Fatal-fault safety net ===================== */
