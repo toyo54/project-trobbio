@@ -27,10 +27,11 @@ fn on_exception(mcause: usize) {
 }
 
 fn task1() {
-    loop {
-        project_trobbio::debug!("Task 1 running");
-        hal::timer::delay_ms(500);
-    }
+    // Runs once and returns -- task_exited() marks this slot (id 1) dead
+    // right after this function returns, freeing it for the *next*
+    // spawn() call to reuse (see the idle loop in `main`, below).
+    project_trobbio::debug!("Task 1 running (one-shot)");
+    hal::timer::delay_ms(500);
 }
 
 fn task2() {
@@ -40,6 +41,35 @@ fn task2() {
         project_trobbio::debug!("Task 2 running");
         hal::timer::delay_ms(500);
     }
+}
+
+/// Spawned conditionally, event-driven off of Task 1's exit -- not part
+/// of the initial `boot_scheduled!` task list.
+fn task3() {
+    loop {
+        project_trobbio::debug!("Task 3 running (spawned after Task 1 exited)");
+        hal::timer::delay_ms(750);
+    }
+}
+
+/// Task 1's on_exit hook: fires once, on Task 1's own stack, right as it
+/// exits. It will land in a *new* slot, not Task 1's own -- spawn()
+/// refuses to reuse the currently-executing task's slot, since that
+/// stack (this call is running on it) isn't actually free yet. Task 1's
+/// old slot becomes available to the next unrelated spawn() instead.
+fn spawn_task3() {
+    match sched::TaskBuilder::new(task3)
+        .priority(sched::Priority::Normal)
+        .spawn()
+    {
+        Ok(id) => project_trobbio::info!("Task 1 exited -- spawned Task 3 into slot {}", id),
+        Err(()) => project_trobbio::error!("Task 3 spawn failed: no free slot"),
+    }
+}
+
+fn task4() {
+    project_trobbio::debug!("Task 4 running - one shot");
+    hal::timer::delay_ms(500);
 }
 
 #[allow(dead_code)]
@@ -64,8 +94,22 @@ pub extern "C" fn main() -> ! {
         timer: on_machine_timer,
         other: on_other_interrupt,
         exception: on_exception,
-        tasks: [task1 => sched::Priority::Low, task2]
+        tasks: [task2]
     );
+
+    // Spawned manually rather than via the macro's task list: on_exit
+    // isn't something `tasks: [...]` supports, and Task 1's whole point
+    // here is the exit hook that spawns Task 3 in its place.
+    sched::TaskBuilder::new(task1)
+        .priority(sched::Priority::Low)
+        .on_exit(spawn_task3)
+        .spawn()
+        .unwrap();
+
+    sched::TaskBuilder::new(task4)
+        .priority(sched::Priority::High)
+        .spawn()
+        .unwrap();
 
     project_trobbio::info!("boot complete, entering idle loop");
 
