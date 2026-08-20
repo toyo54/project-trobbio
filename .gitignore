@@ -16,3 +16,4 @@ target
 **/mutants.out*/
 
 .DS_Store
+./src/.DS_Store
