@@ -7,6 +7,7 @@ use core::panic::PanicInfo;
 pub mod arch;
 pub mod drivers;
 pub mod hal;
+pub mod instrumentation;
 
 global_asm!(include_str!("boot.s"));
 
