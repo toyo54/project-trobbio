@@ -2,6 +2,14 @@
 name = "project-trobbio"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Toyo"]
+description = "A from-scratch bare-metal RISC-V kernel for the ESP32-C6, with hand-written trap handling, a preemptive round-robin scheduler, and thermal-aware eco-scheduling."
+license = "BSD-2-Clause"
+repository = "https://github.com/<your-user>/project-trobbio"
+readme = "README.md"
+keywords = ["esp32c6", "risc-v", "bare-metal", "kernel", "scheduler"]
+categories = ["embedded", "no-std"]
 
 [lib]
 name = "project_trobbio"
