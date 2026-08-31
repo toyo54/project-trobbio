@@ -152,7 +152,7 @@ This crate is **not published on crates.io**; depend on it from git:
 
 ```toml
 [dependencies]
-project-trobbio = { git = "https://github.com/<your-user>/project-trobbio" }
+project-trobbio = { git = "https://github.com/toyo54/project-trobbio" }
 ```
 
 **One manual step is required** in your own project's `build.rs`, regardless of whether you depend via git or a local path:
