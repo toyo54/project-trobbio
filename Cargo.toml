@@ -26,7 +26,7 @@ bench = false
 
 [dependencies]
 riscv = { version = "0.16", features = ["critical-section-single-hart"] }
-esp32c6 = "0.23.2"
+esp32c6 = "0.24.0"
 
 [features]
 default = ["default-panic-handler", "tsens", "led", "uart1"]

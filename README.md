@@ -7,6 +7,7 @@ This is a didactic project, not a general-purpose embedded OS. It targets exactl
 ## Contents
 
 - [Scope](#scope)
+- [Requirements](#requirements)
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
 - [Feature flags](#feature-flags)
@@ -22,6 +23,14 @@ This is a didactic project, not a general-purpose embedded OS. It targets exactl
 - **ESP32-C6 only.** No board abstraction, no other chip support — this is intentional, not a limitation to be fixed later.
 - **Single-hart.** The C6 has one RISC-V hart and this kernel assumes exactly that (`riscv` crate's `critical-section-single-hart` feature).
 - **Demonstrative.** The goal is to make the scheduling mechanism (and the thermal-aware eco-scheduling idea in particular) legible and reproducible, not to compete with production RTOSes.
+
+## Requirements
+
+- **Rust 1.85 or newer** — the crate uses Rust **edition 2024**, which older toolchains cannot build. A stable toolchain is sufficient; no nightly features are used.
+- The **`riscv32imac-unknown-none-elf`** target (added below).
+- **`espflash`** for flashing and serial monitoring.
+
+There is no `rust-toolchain.toml` pin in the repo, so builds use whatever toolchain is active; if you want to pin it, add one selecting a stable release ≥ 1.85.
 
 ## Project structure
 
@@ -83,12 +92,14 @@ cargo build --release
 
 ```
 
-espflash flash --release target/riscv32imac-unknown-none-elf/release/project-trobbio
+espflash flash target/riscv32imac-unknown-none-elf/release/project-trobbio
 espflash monitor
 
 ```
 
-You should see colored `[INFO]`/`[DEBUG]`/`[WARN]`/`[ERROR]` log lines over UART0 (115200 8N1) as the kernel boots, spawns tasks, and runs the UART1 loopback demo.
+Or do both in one step with `espflash flash --monitor <path>`. You should see colored `[INFO]`/`[DEBUG]`/`[WARN]`/`[ERROR]` log lines over UART0 (115200 8N1) as the kernel boots, spawns tasks, and runs the UART1 loopback demo.
+
+Because `main.rs` is also the crate's binary target, `cargo run --release` works too if you have `espflash` configured as the target runner in `.cargo/config.toml`.
 
 ## Feature flags
 
@@ -126,25 +137,25 @@ Handler registration always happens *before* `kernel.enable_interrupts()` is cal
 
 ## Tuning the eco-scheduler thresholds
 
-`sched::warm_threshold()` / `sched::hot_threshold()` are raw TSENS-code cutoffs (not calibrated °C — see `hal/tsens.rs` for why) that gate task eligibility. They're runtime-adjustable via atomics, no `unsafe` required:
+`sched::warm_threshold()` / `sched::hot_threshold()` are raw TSENS-code cutoffs (not calibrated °C — see `hal/tsens.rs` for why) that gate task eligibility. They default to **110 (warm)** and **140 (hot)**, and are runtime-adjustable via atomics, no `unsafe` required:
 
 ```rust
 sched::set_warm_threshold(120);
 sched::set_hot_threshold(150);
 ```
 
-Call this before or after `boot_scheduled!()` — thresholds take effect on the next tick regardless.
+Keep `warm ≤ hot`: the classifier treats readings `≥ hot` as `Hot`, readings `≥ warm` as `Warm`, and everything else as `Cool`. Call the setters before or after `boot_scheduled!()` — thresholds take effect on the next tick regardless.
 
 ## Using this as a dependency
 
-You can either clone this repo directly (above), or depend on it as a library crate:
+This crate is **not published on crates.io**; depend on it from git:
 
 ```toml
 [dependencies]
-project-trobbio = "0.1"
+project-trobbio = { git = "https://github.com/<your-user>/project-trobbio" }
 ```
 
-**One manual step is required** in your own project's `build.rs`:
+**One manual step is required** in your own project's `build.rs`, regardless of whether you depend via git or a local path:
 
 ```rust
 // build.rs
@@ -170,6 +181,8 @@ pub extern "C" fn main() -> ! {
 }
 ```
 
+> **Publishing to crates.io later.** If you ever want `project-trobbio = "0.1"` to work, the `Cargo.toml` needs at least `description`, `license` (e.g. `license = "BSD-2-Clause"`), and `repository` fields before `cargo publish` will accept it.
+
 ## Architecture, briefly
 
 - **Boot** (`boot.s`): sets up the stack, `mtvec`, `gp`, zeroes `.bss`, copies `.data` from flash, jumps to `main`.
@@ -179,7 +192,7 @@ pub extern "C" fn main() -> ! {
 
 ## Stability note
 
-This is a thesis artifact, not a stability-guaranteed library. The public API (`Kernel`, `KernelBuilder`, `sched`, `trap`, driver modules) may change between `0.x` versions without a major-version-style guarantee. Pin an exact version if you depend on it for something that needs to keep working.
+This is a thesis artifact, not a stability-guaranteed library. The public API (`Kernel`, `KernelBuilder`, `sched`, `trap`, driver modules) may change between `0.x` versions without a major-version-style guarantee. Pin an exact version (or a git commit) if you depend on it for something that needs to keep working.
 
 ## License
 
